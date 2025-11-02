@@ -92,6 +92,12 @@ This project demonstrates a decoupled, scalable architecture that processes user
 - Python Lambda programming  
 - Event-driven architecture patterns  
 - CORS and web security  
-- AWS cost optimization  
+- AWS cost optimization
+
+##  Author
+
+**Meron Sibhatu**  
+_Postgraduate Cloud Engineering Student – Calgary, Alberta_
 
 ---
+
