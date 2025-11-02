@@ -1,0 +1,390 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Serverless Feedback Collector - Free Tier Friendly (Fixed ARN references)",
+  "Parameters": {
+    "AdminEmail": {
+      "Type": "String",
+      "Description": "Email address to receive feedback notifications"
+    }
+  },
+  "Resources": {
+    "FeedbackDynamoDBTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "TableName": "FeedbackTable",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "feedback_id",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "feedback_id",
+            "KeyType": "HASH"
+          }
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "StreamSpecification": { "StreamViewType": "NEW_IMAGE" }
+      }
+    },
+
+    "FeedbackQueue": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "QueueName": "feedback-queue",
+        "VisibilityTimeout": 300,
+        "MessageRetentionPeriod": 1200
+      }
+    },
+
+    "FeedbackTopic": {
+      "Type": "AWS::SNS::Topic",
+      "Properties": { "TopicName": "feedback-topic" }
+    },
+
+    "EmailSubscription": {
+      "Type": "AWS::SNS::Subscription",
+      "Properties": {
+        "TopicArn": { "Ref": "FeedbackTopic" },
+        "Protocol": "email",
+        "Endpoint": { "Ref": "AdminEmail" }
+      }
+    },
+
+    "ProcessFeedbackLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "ProcessFeedbackLambdaRole",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Service": "lambda.amazonaws.com" },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "LambdaDynamoDBSQSPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:PutItem",
+                    "sqs:ReceiveMessage",
+                    "sqs:DeleteMessage",
+                    "sqs:GetQueueAttributes"
+                  ],
+                  "Resource": [
+                    { "Fn::GetAtt": [ "FeedbackDynamoDBTable", "Arn" ] },
+                    { "Fn::GetAtt": [ "FeedbackQueue", "Arn" ] }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+
+    "NotifyAdminLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "NotifyAdminLambdaRole",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Service": "lambda.amazonaws.com" },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "LambdaSNSDynamoDBPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "sns:Publish",
+                  "Resource": { "Ref": "FeedbackTopic" }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:DescribeStream",
+                    "dynamodb:GetRecords",
+                    "dynamodb:GetShardIterator",
+                    "dynamodb:ListStreams"
+                  ],
+                  "Resource": { "Fn::GetAtt": [ "FeedbackDynamoDBTable", "StreamArn" ] }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+
+    "ProcessFeedbackLambda": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": "ProcessFeedback",
+        "Runtime": "python3.12",
+        "Handler": "lambda_function.lambda_handler",
+        "Role": { "Fn::GetAtt": [ "ProcessFeedbackLambdaRole", "Arn" ] },
+        "Code": {
+          "S3Bucket": "feedback-lambda-code9916",
+          "S3Key": "process-feedback.zip"
+        },
+        "Timeout": 30,
+        "Environment": {
+          "Variables": {
+            "DYNAMODB_TABLE": { "Ref": "FeedbackDynamoDBTable" }
+          }
+        }
+      }
+    },
+
+    "NotifyAdminLambda": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": "NotifyAdmin",
+        "Runtime": "python3.12",
+        "Handler": "lambda_function.lambda_handler",
+        "Role": { "Fn::GetAtt": [ "NotifyAdminLambdaRole", "Arn" ] },
+        "Code": {
+          "S3Bucket": "feedback-lambda-code9916",
+          "S3Key": "notify-admin.zip"
+        },
+        "Timeout": 30,
+        "Environment": {
+          "Variables": {
+            "SNS_TOPIC_ARN": { "Fn::GetAtt": [ "FeedbackTopic", "TopicArn" ] }
+          }
+        }
+      }
+    },
+
+    "SQSTrigger": {
+      "Type": "AWS::Lambda::EventSourceMapping",
+      "Properties": {
+        "BatchSize": 10,
+        "Enabled": true,
+        "EventSourceArn": { "Fn::GetAtt": [ "FeedbackQueue", "Arn" ] },
+        "FunctionName": { "Fn::GetAtt": [ "ProcessFeedbackLambda", "Arn" ] }
+      },
+      "DependsOn": [ "ProcessFeedbackLambda", "FeedbackQueue" ]
+    },
+
+    "DynamoDBStreamTrigger": {
+      "Type": "AWS::Lambda::EventSourceMapping",
+      "Properties": {
+        "BatchSize": 1,
+        "Enabled": true,
+        "EventSourceArn": { "Fn::GetAtt": [ "FeedbackDynamoDBTable", "StreamArn" ] },
+        "FunctionName": { "Fn::GetAtt": [ "NotifyAdminLambda", "Arn" ] },
+        "StartingPosition": "LATEST"
+      },
+      "DependsOn": [ "NotifyAdminLambda" ]
+    },
+
+    "FeedbackAPI": {
+      "Type": "AWS::ApiGateway::RestApi",
+      "Properties": {
+        "Name": "FeedbackAPI",
+        "Description": "API for submitting feedback",
+        "EndpointConfiguration": { "Types": [ "REGIONAL" ] }
+      }
+    },
+
+    "FeedbackResource": {
+      "Type": "AWS::ApiGateway::Resource",
+      "Properties": {
+        "ParentId": { "Fn::GetAtt": [ "FeedbackAPI", "RootResourceId" ] },
+        "PathPart": "feedback",
+        "RestApiId": { "Ref": "FeedbackAPI" }
+      }
+    },
+
+    "APIGatewaySQSRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Service": "apigateway.amazonaws.com" },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "APIGatewaySQSPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "sqs:SendMessage",
+                  "Resource": { "Fn::GetAtt": [ "FeedbackQueue", "Arn" ] }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+
+    "FeedbackMethod": {
+      "Type": "AWS::ApiGateway::Method",
+      "Properties": {
+        "AuthorizationType": "NONE",
+        "HttpMethod": "POST",
+        "ResourceId": { "Ref": "FeedbackResource" },
+        "RestApiId": { "Ref": "FeedbackAPI" },
+        "Integration": {
+          "Type": "AWS",
+          "IntegrationHttpMethod": "POST",
+          "Credentials": { "Fn::GetAtt": [ "APIGatewaySQSRole", "Arn" ] },
+          "Uri": {
+            "Fn::Join": [
+              "",
+              [
+                "arn:aws:apigateway:",
+                { "Ref": "AWS::Region" },
+                ":sqs:path/",
+                { "Ref": "AWS::AccountId" },
+                "/",
+                { "Ref": "FeedbackQueue" }
+              ]
+            ]
+          },
+          "RequestParameters": {
+            "integration.request.header.Content-Type": "'application/x-www-form-urlencoded'"
+          },
+          "RequestTemplates": {
+            "application/json": "Action=SendMessage&MessageBody=$input.json('$')"
+          },
+          "IntegrationResponses": [
+            {
+              "StatusCode": 200,
+              "ResponseParameters": {
+                "method.response.header.Access-Control-Allow-Origin": "'*'",
+                "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'",
+                "method.response.header.Access-Control-Allow-Methods": "'POST,OPTIONS'"
+              },
+              "ResponseTemplates": {
+                "application/json": "{\"status\": \"success\"}"
+              }
+            }
+          ]
+        },
+        "MethodResponses": [
+          {
+            "StatusCode": 200,
+            "ResponseParameters": {
+              "method.response.header.Access-Control-Allow-Origin": true,
+              "method.response.header.Access-Control-Allow-Headers": true,
+              "method.response.header.Access-Control-Allow-Methods": true
+            },
+            "ResponseModels": {
+              "application/json": "Empty"
+            }
+          }
+        ]
+      }
+    },
+
+    "FeedbackOptionsMethod": {
+      "Type": "AWS::ApiGateway::Method",
+      "Properties": {
+        "AuthorizationType": "NONE",
+        "HttpMethod": "OPTIONS",
+        "ResourceId": { "Ref": "FeedbackResource" },
+        "RestApiId": { "Ref": "FeedbackAPI" },
+        "Integration": {
+          "Type": "MOCK",
+          "IntegrationResponses": [
+            {
+              "StatusCode": 200,
+              "ResponseParameters": {
+                "method.response.header.Access-Control-Allow-Origin": "'*'",
+                "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'",
+                "method.response.header.Access-Control-Allow-Methods": "'POST,OPTIONS'"
+              },
+              "ResponseTemplates": {
+                "application/json": "{\"statusCode\": 200}"
+              }
+            }
+          ],
+          "RequestTemplates": {
+            "application/json": "{\"statusCode\": 200}"
+          }
+        },
+        "MethodResponses": [
+          {
+            "StatusCode": 200,
+            "ResponseParameters": {
+              "method.response.header.Access-Control-Allow-Origin": true,
+              "method.response.header.Access-Control-Allow-Headers": true,
+              "method.response.header.Access-Control-Allow-Methods": true
+            },
+            "ResponseModels": {
+              "application/json": "Empty"
+            }
+          }
+        ]
+      }
+    },
+
+    "APIDeployment": {
+      "Type": "AWS::ApiGateway::Deployment",
+      "DependsOn": "FeedbackMethod",
+      "Properties": { "RestApiId": { "Ref": "FeedbackAPI" } }
+    },
+
+    "APIStage": {
+      "Type": "AWS::ApiGateway::Stage",
+      "Properties": {
+        "RestApiId": { "Ref": "FeedbackAPI" },
+        "StageName": "prod",
+        "DeploymentId": { "Ref": "APIDeployment" }
+      }
+    }
+  },
+
+  "Outputs": {
+    "APIEndpoint": {
+      "Description": "URL for API Gateway endpoint",
+      "Value": {
+        "Fn::Join": [
+          "",
+          [
+            "https://",
+            { "Ref": "FeedbackAPI" },
+            ".execute-api.",
+            { "Ref": "AWS::Region" },
+            ".amazonaws.com/prod/feedback"
+          ]
+        ]
+      }
+    }
+  }
+}
